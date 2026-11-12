@@ -15,43 +15,46 @@
 package caddy
 
 import (
-	"net/url"
 	"testing"
 )
 
 // TestAdminHandlerOriginAllowed_CaseInsensitiveHost is the regression
 // test for the host allow-list comparison being case-sensitive. Per
 // RFC 3986 §3.2.2, host names are case-insensitive.
+//
+// Origins are now normalized to originTuples before comparison; these
+// cases lock in that the normalization preserves the case-insensitive
+// behavior.
 func TestAdminHandlerOriginAllowed_CaseInsensitiveHost(t *testing.T) {
-	mustParse := func(raw string) *url.URL {
-		u, err := url.Parse(raw)
-		if err != nil {
-			t.Fatalf("invalid URL %q: %v", raw, err)
-		}
-		return u
-	}
-
 	cases := []struct {
 		name    string
-		allowed *url.URL
-		origin  *url.URL
+		allowed string
+		origin  string
 	}{
 		{
 			name:    "allow-list uppercase, origin lowercase",
-			allowed: mustParse("http://Example.com:8080"),
-			origin:  mustParse("http://example.com:8080"),
+			allowed: "http://Example.com:8080",
+			origin:  "http://example.com:8080",
 		},
 		{
 			name:    "allow-list lowercase, origin uppercase",
-			allowed: mustParse("http://example.com:8080"),
-			origin:  mustParse("http://EXAMPLE.com:8080"),
+			allowed: "http://example.com:8080",
+			origin:  "http://EXAMPLE.com:8080",
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := adminHandler{allowedOrigins: []*url.URL{tc.allowed}}
-			if !h.originAllowed(tc.origin) {
+			allowed, err := parseOrigin(tc.allowed)
+			if err != nil {
+				t.Fatalf("invalid allowed origin %q: %v", tc.allowed, err)
+			}
+			origin, err := parseOrigin(tc.origin)
+			if err != nil {
+				t.Fatalf("invalid origin %q: %v", tc.origin, err)
+			}
+			h := adminHandler{allowedOrigins: []originTuple{allowed}}
+			if !h.originAllowed(origin) {
 				t.Errorf("originAllowed(%v) with allowed %v = false, want true", tc.origin, tc.allowed)
 			}
 		})

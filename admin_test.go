@@ -633,7 +633,7 @@ func TestAllowedOriginsUnixSocket(t *testing.T) {
 
 			var gotOrigins []string
 			for _, u := range got {
-				gotOrigins = append(gotOrigins, u.Host)
+				gotOrigins = append(gotOrigins, u.String())
 			}
 
 			if len(gotOrigins) != len(test.expectOrigins) {

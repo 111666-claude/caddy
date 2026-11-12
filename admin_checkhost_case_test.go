@@ -16,7 +16,6 @@ package caddy
 
 import (
 	"net/http/httptest"
-	"net/url"
 	"testing"
 )
 
@@ -26,42 +25,38 @@ import (
 // case, so the comparison must fold case. This mirrors the fix applied to
 // originAllowed, where an allowed 'http://Example.com:8080' rejected a
 // client Host of 'example.com:8080'.
+//
+// Host and configured origins are now both normalized to originTuples
+// before comparison; these cases lock in that the normalization preserves
+// the case-insensitive behavior.
 func TestAdminHandlerCheckHostCaseInsensitive(t *testing.T) {
-	mustParse := func(raw string) *url.URL {
-		u, err := url.Parse(raw)
-		if err != nil {
-			t.Fatalf("invalid URL %q: %v", raw, err)
-		}
-		return u
-	}
-
 	cases := []struct {
 		name    string
-		allowed *url.URL
+		allowed string
 		host    string
 		wantErr bool
 	}{
 		{
 			name:    "allow-list uppercase, request Host lowercase",
-			allowed: mustParse("http://Example.com:2019"),
+			allowed: "http://Example.com:2019",
 			host:    "example.com:2019",
 			wantErr: false,
 		},
 		{
 			name:    "allow-list lowercase, request Host uppercase",
-			allowed: mustParse("http://example.com:2019"),
+			allowed: "http://example.com:2019",
 			host:    "EXAMPLE.com:2019",
 			wantErr: false,
 		},
 		{
 			name:    "default localhost entry, request Host uppercase",
-			allowed: mustParse("http://localhost:2019"),
+			allowed: "http://localhost:2019",
 			host:    "LOCALHOST:2019",
 			wantErr: false,
 		},
 		{
 			name:    "different host is still rejected",
-			allowed: mustParse("http://example.com:2019"),
+			allowed: "http://example.com:2019",
 			host:    "evil.example.org:2019",
 			wantErr: true,
 		},
@@ -69,9 +64,13 @@ func TestAdminHandlerCheckHostCaseInsensitive(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			h := adminHandler{allowedOrigins: []*url.URL{tc.allowed}}
+			allowed, err := parseOrigin(tc.allowed)
+			if err != nil {
+				t.Fatalf("invalid allowed origin %q: %v", tc.allowed, err)
+			}
+			h := adminHandler{allowedOrigins: []originTuple{allowed}}
 			r := httptest.NewRequest("GET", "http://"+tc.host+"/config/", nil)
-			err := h.checkHost(r)
+			err = h.checkHost(r)
 			if tc.wantErr && err == nil {
 				t.Errorf("checkHost(%q) with allowed %v = nil, want error", tc.host, tc.allowed)
 			}

@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -103,6 +104,16 @@ type AdminConfig struct {
 	// set, the listener address will be the default value. If set but
 	// empty, no origins will be allowed. Enforced only on local
 	// (plaintext) endpoint.
+	//
+	// Each entry is either a bare authority (`host` or `host:port`,
+	// matching any scheme) or a full origin (`scheme://host[:port]`).
+	// Entries are normalized before comparison: DNS names are
+	// case-insensitive and a trailing root dot is ignored, IP literals
+	// are canonicalized, and default ports (80 for http/ws, 443 for
+	// https/wss) are elided when a scheme is given. Entries with
+	// userinfo, paths, query strings, fragments, empty hosts, invalid
+	// ports, or IPv6 zone identifiers are rejected and simply allow
+	// nothing (fail closed).
 	Origins []string `json:"origins,omitempty"`
 
 	// Options pertaining to configuration management.
@@ -294,16 +305,17 @@ func (admin *AdminConfig) newAdminHandler(addr NetworkAddress, remote bool, ctx 
 	return muxWrap, nil
 }
 
-// allowedOrigins returns a list of origins that are allowed.
-// If admin.Origins is nil (null), the provided listen address
-// will be used as the default origin. If admin.Origins is
-// empty, no origins will be allowed, effectively bricking the
-// endpoint for non-unix-socket endpoints, but whatever.
-func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
-	uniqueOrigins := make(map[string]struct{})
-	for _, o := range admin.Origins {
-		uniqueOrigins[o] = struct{}{}
-	}
+// allowedOrigins returns the list of origins that are allowed, each
+// normalized to its canonical originTuple form. If admin.Origins is nil
+// (null), the provided listen address will be used as the default origin.
+// If admin.Origins is empty, no origins will be allowed, effectively
+// bricking the endpoint for non-unix-socket endpoints, but whatever.
+//
+// Configured origins that cannot be normalized are skipped, so a
+// malformed entry allows nothing (fail closed) instead of being compared
+// loosely.
+func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []originTuple {
+	uniqueOrigins := make(map[originTuple]struct{})
 	// RFC 2616, Section 14.26:
 	// "A client MUST include a Host header field in all HTTP/1.1 request
 	// messages. If the requested URI does not include an Internet host
@@ -337,31 +349,31 @@ func (admin AdminConfig) allowedOrigins(addr NetworkAddress) []*url.URL {
 	// See also the discussion in #6832.
 	if admin.Origins == nil && !addr.IsUnixNetwork() && !addr.IsFdNetwork() {
 		if addr.isLoopback() {
-			uniqueOrigins[net.JoinHostPort("localhost", addr.port())] = struct{}{}
-			uniqueOrigins[net.JoinHostPort("::1", addr.port())] = struct{}{}
-			uniqueOrigins[net.JoinHostPort("127.0.0.1", addr.port())] = struct{}{}
+			// the default loopback policy: allow the standard loopback
+			// spellings on the listen port, and nothing else
+			for _, host := range []string{"localhost", "::1", "127.0.0.1"} {
+				if t, err := parseOrigin(net.JoinHostPort(host, addr.port())); err == nil {
+					uniqueOrigins[t] = struct{}{}
+				}
+			}
 		} else {
-			uniqueOrigins[addr.JoinHostPort(0)] = struct{}{}
+			if t, err := parseOrigin(addr.JoinHostPort(0)); err == nil {
+				uniqueOrigins[t] = struct{}{}
+			}
 		}
 	}
-	allowed := make([]*url.URL, 0, len(uniqueOrigins))
-	for originStr := range uniqueOrigins {
-		var origin *url.URL
-		if strings.Contains(originStr, "://") {
-			var err error
-			origin, err = url.Parse(originStr)
-			if err != nil {
-				continue
-			}
-			origin.Path = ""
-			origin.RawPath = ""
-			origin.Fragment = ""
-			origin.RawFragment = ""
-			origin.RawQuery = ""
-		} else {
-			origin = &url.URL{Host: originStr}
+	for _, o := range admin.Origins {
+		t, err := parseOrigin(o)
+		if err != nil {
+			// fail closed: an origin we cannot normalize is dropped,
+			// so it matches nothing
+			continue
 		}
-		allowed = append(allowed, origin)
+		uniqueOrigins[t] = struct{}{}
+	}
+	allowed := make([]originTuple, 0, len(uniqueOrigins))
+	for t := range uniqueOrigins {
+		allowed = append(allowed, t)
 	}
 	return allowed
 }
@@ -449,7 +461,7 @@ func replaceLocalAdminServer(cfg *Config, ctx Context) error {
 	adminLogger.Info("admin endpoint started",
 		zap.String("address", addr.String()),
 		zap.Bool("enforce_origin", cfg.Admin.EnforceOrigin),
-		zap.Array("origins", loggableURLArray(handler.allowedOrigins)))
+		zap.Array("origins", loggableOriginTupleArray(handler.allowedOrigins)))
 
 	if !handler.enforceHost {
 		adminLogger.Warn("admin endpoint on open interface; host checking disabled",
@@ -809,7 +821,7 @@ type adminHandler struct {
 	// security for local/plaintext endpoint
 	enforceOrigin  bool
 	enforceHost    bool
-	allowedOrigins []*url.URL
+	allowedOrigins []originTuple
 
 	// security for remote/encrypted endpoint
 	remoteControl *RemoteAdmin
@@ -957,35 +969,41 @@ func (h adminHandler) handleError(w http.ResponseWriter, r *http.Request, err er
 	}
 }
 
-// checkHost returns a handler that wraps next such that
-// it will only be called if the request's Host header matches
-// a trustworthy/expected value. This helps to mitigate DNS
-// rebinding attacks.
+// checkHost ensures that the request's Host header matches one of the
+// allowed origins. This helps to mitigate DNS rebinding attacks. The
+// Host value is normalized with exactly the same rules as configured
+// origins (see parseOriginAuthority), so the comparison is exact on
+// canonical forms: no prefix/suffix/contains matching, no wildcards, and
+// no DNS resolution. Proxy headers such as X-Forwarded-Host are
+// deliberately not consulted; they are client-controlled and must not
+// weaken this check.
 func (h adminHandler) checkHost(r *http.Request) error {
-	allowed := slices.ContainsFunc(h.allowedOrigins, func(u *url.URL) bool {
-		// Host comparison is case-insensitive per RFC 3986 §3.2.2, same as
-		// the Origin check below; url.Parse does not normalize host case.
-		return strings.EqualFold(r.Host, u.Host)
-	})
-	if !allowed {
-		return APIError{
-			HTTPStatus: http.StatusForbidden,
-			Err:        fmt.Errorf("host not allowed: %s", r.Host),
+	hostTuple, err := parseOriginAuthority(r.Host)
+	if err == nil {
+		allowed := slices.ContainsFunc(h.allowedOrigins, func(allowedOrigin originTuple) bool {
+			return allowedOrigin.host == hostTuple.host && allowedOrigin.port == hostTuple.port
+		})
+		if allowed {
+			return nil
 		}
 	}
-	return nil
+	return APIError{
+		HTTPStatus: http.StatusForbidden,
+		Err:        fmt.Errorf("host not allowed: %s", r.Host),
+	}
 }
 
 // checkOrigin ensures that the Origin header, if
 // set, matches the intended target; prevents arbitrary
 // sites from issuing requests to our listener. It
-// returns the origin that was obtained from r.
+// returns the origin that was obtained from r, suitable
+// for echoing back in Access-Control-Allow-Origin.
 func (h adminHandler) checkOrigin(r *http.Request) (string, error) {
-	originStr, origin := h.getOrigin(r)
-	if origin == nil {
+	originStr, origin, err := h.getOrigin(r)
+	if err != nil {
 		return "", APIError{
 			HTTPStatus: http.StatusForbidden,
-			Err:        fmt.Errorf("required Origin header is missing or invalid"),
+			Err:        err,
 		}
 	}
 	if !h.originAllowed(origin) {
@@ -994,38 +1012,341 @@ func (h adminHandler) checkOrigin(r *http.Request) (string, error) {
 			Err:        fmt.Errorf("client is not allowed to access from origin '%s'", originStr),
 		}
 	}
-	return origin.String(), nil
+	return originStr, nil
 }
 
-func (h adminHandler) getOrigin(r *http.Request) (string, *url.URL) {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		origin = r.Header.Get("Referer")
+// getOrigin determines the normalized origin of the request. It returns
+// the string to echo back to the client along with the canonical origin
+// tuple. The Origin header is authoritative; if it is present but
+// malformed, the request fails closed — we must NOT fall back to the
+// Referer in that case, or an attacker could pair a bogus Origin with an
+// innocuous Referer to slip past the check. Only when no usable Origin
+// header is present do we consult the Referer (a full URL, so its path,
+// query, and fragment are expected and ignored).
+func (h adminHandler) getOrigin(r *http.Request) (string, originTuple, error) {
+	originHeaders := r.Header["Origin"]
+	if len(originHeaders) > 1 {
+		// a well-behaved client never sends more than one Origin
+		// header; fail closed rather than guess which one is real
+		return "", originTuple{}, fmt.Errorf("multiple Origin headers")
 	}
-	originURL, err := url.Parse(origin)
+	if len(originHeaders) == 1 && originHeaders[0] != "" {
+		if !strings.Contains(originHeaders[0], "://") {
+			// a serialized origin always has a scheme (RFC 6454);
+			// anything else — including "null", which is also rejected
+			// earlier in serveHTTP — is malformed, so fail closed
+			return "", originTuple{}, fmt.Errorf("Origin header is not a serialized origin")
+		}
+		origin, err := parseOrigin(originHeaders[0])
+		if err != nil {
+			return "", originTuple{}, fmt.Errorf("invalid Origin header: %v", err)
+		}
+		return originHeaders[0], origin, nil
+	}
+	referer := r.Header.Get("Referer")
+	if referer == "" {
+		return "", originTuple{}, fmt.Errorf("required Origin header is missing or invalid")
+	}
+	origin, err := parseRefererOrigin(referer)
 	if err != nil {
-		return origin, nil
+		return "", originTuple{}, fmt.Errorf("invalid Referer header: %v", err)
 	}
-	originURL.Path = ""
-	originURL.RawPath = ""
-	originURL.Fragment = ""
-	originURL.RawFragment = ""
-	originURL.RawQuery = ""
-	return origin, originURL
+	return origin.String(), origin, nil
 }
 
-func (h adminHandler) originAllowed(origin *url.URL) bool {
+// originAllowed reports whether the normalized request origin matches
+// any of the normalized allowed origins. A configured origin without a
+// scheme matches any request scheme, preserving the historical behavior
+// of host-only entries; host and port must always match exactly.
+func (h adminHandler) originAllowed(origin originTuple) bool {
 	for _, allowedOrigin := range h.allowedOrigins {
-		if allowedOrigin.Scheme != "" && origin.Scheme != allowedOrigin.Scheme {
+		if allowedOrigin.scheme != "" && allowedOrigin.scheme != origin.scheme {
 			continue
 		}
-		// Host comparison is case-insensitive per RFC 3986 §3.2.2; url.Parse
-		// does not normalize host case, so fold it here.
-		if strings.EqualFold(origin.Host, allowedOrigin.Host) {
+		if allowedOrigin.host == origin.host && allowedOrigin.port == origin.port {
 			return true
 		}
 	}
 	return false
+}
+
+// originTuple is the canonical form of an origin (or a host:port
+// authority) against which admin API requests are authorized. Both the
+// configured allowed origins and the Host/Origin/Referer values of each
+// request are normalized to this form before comparison, so equivalent
+// spellings (letter case, trailing DNS root dot, default ports, IP
+// literal formatting) compare equal — and nothing else does.
+type originTuple struct {
+	// scheme is the lowercase URL scheme, or empty if the origin was
+	// configured without one (host-only); an empty scheme matches any
+	// request scheme, preserving historical behavior for host-only
+	// entries.
+	scheme string
+	// host is the canonical host: a lowercase DNS name with any
+	// trailing root dot removed, or a canonical IP literal (no
+	// brackets, no zone).
+	host string
+	// port is the canonical decimal port, or empty if none was given.
+	// Default ports (80 for http/ws, 443 for https/wss) are elided
+	// when the scheme is known.
+	port string
+}
+
+// String renders the tuple as scheme://host[:port] (or host[:port] if
+// there is no scheme), bracketing IPv6 literals. It is used for logging
+// and for the Access-Control-Allow-Origin response header.
+func (t originTuple) String() string {
+	hostport := t.host
+	if t.port != "" {
+		hostport = net.JoinHostPort(t.host, t.port)
+	} else if strings.Contains(hostport, ":") {
+		hostport = "[" + hostport + "]"
+	}
+	if t.scheme != "" {
+		return t.scheme + "://" + hostport
+	}
+	return hostport
+}
+
+// elideDefaultPort drops the port if it is the default for the scheme,
+// so that e.g. http://example.com and http://example.com:80 normalize
+// to the same tuple.
+func (t *originTuple) elideDefaultPort() {
+	switch t.scheme {
+	case "http", "ws":
+		if t.port == "80" {
+			t.port = ""
+		}
+	case "https", "wss":
+		if t.port == "443" {
+			t.port = ""
+		}
+	}
+}
+
+// hasOriginControlChars reports whether s contains whitespace, other
+// ASCII control characters, or DEL. Such bytes are rejected outright
+// rather than normalized, so ambiguous spellings cannot be smuggled
+// past the allow-list.
+func hasOriginControlChars(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// parseOrigin normalizes a configured origin or an Origin header value.
+// The value must be either a bare authority (host with optional port)
+// or a scheme followed by an authority. Userinfo, paths, query strings,
+// and fragments are rejected rather than silently stripped: a
+// serialized origin never contains them (RFC 6454), so their presence
+// indicates a malformed or crafted value, and we fail closed.
+func parseOrigin(origin string) (originTuple, error) {
+	if origin == "" {
+		return originTuple{}, fmt.Errorf("empty origin")
+	}
+	if hasOriginControlChars(origin) {
+		return originTuple{}, fmt.Errorf("origin contains whitespace or control characters")
+	}
+	if !strings.Contains(origin, "://") {
+		return parseOriginAuthority(origin)
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return originTuple{}, fmt.Errorf("malformed origin URL: %v", err)
+	}
+	if u.User != nil {
+		return originTuple{}, fmt.Errorf("userinfo is not allowed in origins")
+	}
+	if u.Path != "" || u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return originTuple{}, fmt.Errorf("paths, query strings, and fragments are not allowed in origins")
+	}
+	if u.Scheme == "" {
+		return originTuple{}, fmt.Errorf("origin has no scheme")
+	}
+	t, err := parseOriginAuthority(u.Host)
+	if err != nil {
+		return originTuple{}, err
+	}
+	t.scheme = strings.ToLower(u.Scheme)
+	t.elideDefaultPort()
+	return t, nil
+}
+
+// parseRefererOrigin extracts the origin tuple from a Referer header
+// value. Unlike an Origin header, a Referer is a full URL, so a path,
+// query, or fragment is expected and ignored; everything else is held
+// to the same standard as parseOrigin.
+func parseRefererOrigin(referer string) (originTuple, error) {
+	if referer == "" {
+		return originTuple{}, fmt.Errorf("empty referer")
+	}
+	if hasOriginControlChars(referer) {
+		return originTuple{}, fmt.Errorf("referer contains whitespace or control characters")
+	}
+	u, err := url.Parse(referer)
+	if err != nil {
+		return originTuple{}, fmt.Errorf("malformed referer URL: %v", err)
+	}
+	if u.User != nil {
+		return originTuple{}, fmt.Errorf("userinfo is not allowed in referer")
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return originTuple{}, fmt.Errorf("referer is not an absolute URL")
+	}
+	t, err := parseOriginAuthority(u.Host)
+	if err != nil {
+		return originTuple{}, err
+	}
+	t.scheme = strings.ToLower(u.Scheme)
+	t.elideDefaultPort()
+	return t, nil
+}
+
+// parseOriginAuthority normalizes a bare authority — a host with an
+// optional port, and no scheme — into an originTuple. This is used for
+// the request's Host header and for host-only configured origins, so
+// both sides of the Host check share identical normalization rules.
+func parseOriginAuthority(authority string) (originTuple, error) {
+	if authority == "" {
+		return originTuple{}, fmt.Errorf("empty host")
+	}
+	if hasOriginControlChars(authority) {
+		return originTuple{}, fmt.Errorf("host contains whitespace or control characters")
+	}
+	host, port, err := splitOriginHostPort(authority)
+	if err != nil {
+		return originTuple{}, err
+	}
+	normHost, err := normalizeOriginHost(host)
+	if err != nil {
+		return originTuple{}, err
+	}
+	t := originTuple{host: normHost}
+	if port != "" {
+		normPort, err := normalizeOriginPort(port)
+		if err != nil {
+			return originTuple{}, err
+		}
+		t.port = normPort
+	}
+	return t, nil
+}
+
+// splitOriginHostPort splits an authority into host and port. Unlike
+// net.SplitHostPort, a missing port is not an error; an empty port
+// after a colon, duplicate colons outside brackets, and other ambiguous
+// forms are rejected.
+func splitOriginHostPort(authority string) (host, port string, err error) {
+	if strings.HasPrefix(authority, "[") {
+		end := strings.Index(authority, "]")
+		if end < 0 {
+			return "", "", fmt.Errorf("missing closing bracket in IP literal")
+		}
+		host = authority[:end+1]
+		switch rest := authority[end+1:]; {
+		case rest == "":
+			// no port
+		case rest == ":":
+			return "", "", fmt.Errorf("empty port")
+		case strings.HasPrefix(rest, ":"):
+			port = rest[1:]
+		default:
+			return "", "", fmt.Errorf("unexpected characters after bracketed host")
+		}
+		return host, port, nil
+	}
+	if strings.Count(authority, ":") > 1 {
+		return "", "", fmt.Errorf("IPv6 literals must be bracketed")
+	}
+	if i := strings.LastIndex(authority, ":"); i >= 0 {
+		if i == len(authority)-1 {
+			return "", "", fmt.Errorf("empty port")
+		}
+		host, port = authority[:i], authority[i+1:]
+	} else {
+		host = authority
+	}
+	return host, port, nil
+}
+
+// normalizeOriginHost canonicalizes the host part of an origin or Host
+// header. DNS names are lowercased and a single trailing root dot is
+// removed (host comparison is case-insensitive per RFC 3986 §3.2.2, and
+// the root dot denotes the same name); IP literals are parsed and
+// re-rendered in canonical form without brackets. Anything ambiguous or
+// malformed — empty hosts, userinfo, percent-encoding, unbracketed
+// IPv6, IPv6 zone identifiers — is rejected, because guessing at its
+// meaning could weaken the check. No DNS resolution is performed.
+func normalizeOriginHost(host string) (string, error) {
+	if host == "" {
+		return "", fmt.Errorf("empty host")
+	}
+	if strings.ContainsAny(host, "@%") {
+		// '@' would mean userinfo, which origins and Host headers must
+		// not carry; '%' would mean percent-encoding or an IPv6 zone,
+		// both of which are ambiguous in this context
+		return "", fmt.Errorf("host contains userinfo or percent-encoded characters")
+	}
+	if strings.HasPrefix(host, "[") {
+		if !strings.HasSuffix(host, "]") {
+			return "", fmt.Errorf("malformed bracketed IP literal")
+		}
+		return canonicalOriginIP(host[1 : len(host)-1])
+	}
+	if strings.ContainsAny(host, "/?#[]") {
+		return "", fmt.Errorf("host contains URL structural characters")
+	}
+	if strings.Contains(host, ":") {
+		return "", fmt.Errorf("IPv6 literals must be bracketed")
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return canonicalOriginIP(host)
+	}
+	// DNS name: case-insensitive, and a single trailing dot denotes
+	// the DNS root without changing the name
+	host = strings.ToLower(host)
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || strings.HasSuffix(host, ".") {
+		return "", fmt.Errorf("malformed DNS name")
+	}
+	return host, nil
+}
+
+// canonicalOriginIP parses s as an IP literal and returns its canonical
+// string form. IPv6 zone identifiers (e.g. fe80::1%eth0) are rejected:
+// they are interface-local and ambiguous to compare. IPv4-mapped IPv6
+// addresses are rendered in their IPv4 form.
+func canonicalOriginIP(s string) (string, error) {
+	ip, err := netip.ParseAddr(s)
+	if err != nil {
+		return "", fmt.Errorf("malformed IP literal: %v", err)
+	}
+	if ip.Zone() != "" {
+		return "", fmt.Errorf("IPv6 zone identifiers are not allowed")
+	}
+	return ip.Unmap().String(), nil
+}
+
+// normalizeOriginPort canonicalizes a port string. The port must be
+// decimal digits within the valid TCP/UDP range; the canonical form has
+// no leading zeros, so equivalent spellings compare equal.
+func normalizeOriginPort(port string) (string, error) {
+	if port == "" {
+		return "", fmt.Errorf("empty port")
+	}
+	for i := 0; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return "", fmt.Errorf("port contains non-numeric characters")
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n > 65535 {
+		return "", fmt.Errorf("port out of range")
+	}
+	return strconv.Itoa(n), nil
 }
 
 // etagHasher returns the hasher we used on the config to both
@@ -1459,9 +1780,9 @@ func decodeBase64DERCert(certStr string) (*x509.Certificate, error) {
 	return x509.ParseCertificate(derBytes)
 }
 
-type loggableURLArray []*url.URL
+type loggableOriginTupleArray []originTuple
 
-func (ua loggableURLArray) MarshalLogArray(enc zapcore.ArrayEncoder) error {
+func (ua loggableOriginTupleArray) MarshalLogArray(enc zapcore.ArrayEncoder) error {
 	if ua == nil {
 		return nil
 	}
